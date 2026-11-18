@@ -34,7 +34,14 @@ import { IMAGES_DIR, REF_IMAGES_DIR, ensureLayout } from "./datadir.js";
 import { ffmpegPath, runFfmpeg } from "./ffmpeg.js";
 import { logDebug, logInfo, logWarn } from "./logs.js";
 import { netCodes, whyNetwork } from "./net.js";
-import { GEMINI_SAFETY_OFF, apiType, geminiHeaders, geminiModelUrl } from "./apitype.js";
+import {
+  GEMINI_SAFETY_OFF,
+  apiType,
+  assertKeyIsNotServiceAccount,
+  geminiHeaders,
+  geminiModelUrl,
+} from "./apitype.js";
+import { isVertexClaude, vertexAuth, vertexModelUrl } from "./vertex.js";
 import {
   NOVELAI_TRANSLATE_PROMPT,
   cleanTranslation,
@@ -787,6 +794,27 @@ export function extForMime(mimeType) {
   return EXT_FOR_MIME[String(mimeType ?? "").trim().toLowerCase()] ?? ".png";
 }
 
+/*
+ * ISOBMFF 的 brand → 具体是哪种图（下面 sniffImageType 用）。
+ *
+ * `heic`/`heix` 是单张 HEVC 图，`hevc`/`hevx` 是图片序列，`heim`/`heis`/
+ * `hevm`/`hevs` 是多视角和缩放序列 —— 对我们都一样：一张图，送去识别。
+ * `mif1`/`msf1` 是 HEIF 的通用 brand（不保证内层编码是 HEVC），有些安卓机
+ * 和修图软件存出来就是这个，报 image/heif 更准确，Gemini 两种都收。
+ */
+const HEIC_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs"]);
+const HEIF_BRANDS = new Set(["mif1", "msf1"]);
+const AVIF_BRANDS = new Set(["avif", "avis"]);
+
+/**
+ * 上面这三种**不交给 ffmpeg**，原样送去识别；残缺校验也走 ISOBMFF 那条路。
+ *
+ * 一句话：打包的 ffmpeg 6.1 解不了图块网格结构的 HEIC/AVIF，会悄悄压出
+ * 一片死色（退出码 0、stderr 不吭声），而 Gemini 原生就收这几种。
+ * 详见 shrinkForVision 里 HEIC 那段。
+ */
+const NO_FFMPEG_STILLS = new Set(["image/heic", "image/heif", "image/avif"]);
+
 /**
  * 从**字节**里认图片类型，认不出返回 null（后缀带点，和 REF_EXTS 一个形状）。
  *
@@ -812,6 +840,27 @@ export function sniffImageType(buf) {
   if (buf.toString("ascii", 0, 3) === "GIF") {
     return { mimeType: "image/gif", ext: ".gif" };
   }
+  /*
+   * HEIC / HEIF / AVIF —— iPhone 直出的照片就是这个。
+   *
+   * 这几种都装在 ISOBMFF 容器里（和 mp4 同一套 box 结构），开头是
+   * `[4 字节 box 大小]ftyp[4 字节 brand]`，靠 brand 区分是图还是视频。
+   * mp4 / mov 的 brand 是 `isom` / `mp42` / `qt  ` 这些，不在下面的表里，
+   * 所以视频不会被误认成图片。
+   *
+   * **加这一条是在修一个实机 bug**：以前这里认不出 HEIC、返回 null，
+   * 于是 shrinkForVision 把它当 png 丢给 ffmpeg，而打包的 ffmpeg 6.1
+   * 解不了 iPhone 那种切成图块的 HEIC —— 它只解出一小条、其余填成平色、
+   * 然后**退出码 0**，一张「灰蒙蒙的图」就这么被当成好图送去识别，
+   * 模型照着那片灰一本正经地描述一通。详见 NO_FFMPEG_STILLS 和
+   * shrinkForVision 里 HEIC 那段。
+   */
+  if (buf.length >= 12 && buf.toString("ascii", 4, 8) === "ftyp") {
+    const brand = buf.toString("ascii", 8, 12);
+    if (HEIC_BRANDS.has(brand)) return { mimeType: "image/heic", ext: ".heic" };
+    if (HEIF_BRANDS.has(brand)) return { mimeType: "image/heif", ext: ".heif" };
+    if (AVIF_BRANDS.has(brand)) return { mimeType: "image/avif", ext: ".avif" };
+  }
   return null;
 }
 
@@ -833,13 +882,18 @@ export function sniffImageType(buf) {
  * 残缺字节交出来（理由见那边的注释）。所以识别前再验一道尾巴 —— 这道**不**
  * 依赖任何外部报的数字，只看这份字节自己说不说得通。
  *
- * ── 为什么只认 JPEG 和 PNG ──
+ * ── 认得出的几种 ──
  *
- * 这两种有明确、固定、就在最后几个字节的结束标记：JPEG 的 EOI（FFD9）、
- * PNG 的 IEND 块。WebP / GIF 的结构没这么干脆（WebP 靠 RIFF 长度字段、
- * GIF 的 trailer 只有一个字节 0x3B，太容易在残缺数据里偶然命中），认不准
- * 的一律返回 true —— 这道校验的职责是「抓住确凿的残缺」，不是「证明完整」。
- * 宁可漏掉几张也不能把好图误杀，那样代价是角色看不见对方发的图。
+ * JPEG 和 PNG 有明确、固定、就在最后几个字节的结束标记：JPEG 的 EOI（FFD9）、
+ * PNG 的 IEND 块。HEIC / HEIF / AVIF 没有结束标记，但它们是 ISOBMFF 容器，
+ * 顶层 box 自报长度，截断了就会有一个 box 声明的末尾落在文件外面 —— 那是
+ * 确凿的残缺（见 isobmffComplete）。这条对 HEIC 尤其要紧：它压根不进 ffmpeg
+ * （见 shrinkForVision），这里是唯一一道能拦住半份 HEIC 的闸。
+ *
+ * WebP / GIF 的结构没这么干脆（WebP 靠 RIFF 长度字段、GIF 的 trailer 只有
+ * 一个字节 0x3B，太容易在残缺数据里偶然命中），认不准的一律返回 true ——
+ * 这道校验的职责是「抓住确凿的残缺」，不是「证明完整」。宁可漏掉几张也不能
+ * 把好图误杀，那样代价是角色看不见对方发的图。
  *
  * JPEG 的 FFD9 往后找一小段而不是死抠最后两个字节：有些相机和聊天软件会在
  * EOI 后面追 EXIF 缩略图或者填充字节，抠死了会把完整的图判成残缺。
@@ -865,7 +919,54 @@ export function imageLooksComplete(buf) {
     if (buf.length < 12) return false;
     return buf.subarray(buf.length - 8, buf.length - 4).toString("ascii") === "IEND";
   }
+  if (NO_FFMPEG_STILLS.has(hit.mimeType)) return isobmffComplete(buf);
   return true;
+}
+
+/**
+ * 走一遍 ISOBMFF 的顶层 box 链，看最后一个 box 收不收得住。
+ *
+ * 容器长这样：一串 `[4 字节 size][4 字节 type][...内容]`，size 把**自己这 8 个
+ * 字节头也算在内**。完整的文件里最后一个 box 的末尾正好落在文件末尾；
+ * 截断的文件里，装着图像数据的 `mdat`（通常是最后、也是最大的那个 box）会
+ * 声明一个落在文件外面的末尾 —— 那就是确凿的残缺。
+ *
+ * 两个特殊的 size 按规范处理：`1` 表示真长度在后面 8 个字节里（64 位，
+ * 大文件用），`0` 表示「一直到文件结尾」（合法，判完整）。
+ *
+ * 和这个文件里其它校验一个口径：**只抓确凿的残缺**。box 头读不完整、长度
+ * 不合规、或者走着走着对不上了，一律返回 true 交给下游 —— 这几种都可能是
+ * 我们对格式的理解不够，而误杀一张好图的代价是角色看不见对方发的图。
+ *
+ * @param {Buffer} buf 图片字节
+ * @returns {boolean} 确凿残缺时 false
+ */
+function isobmffComplete(buf) {
+  let at = 0;
+  // 加个上限防着畸形文件里的 0 长度 box 把我们钉在原地（真实文件个位数个顶层 box）
+  for (let guard = 0; guard < 64; guard += 1) {
+    if (at === buf.length) return true; // 正好收在文件末尾
+    if (at + 8 > buf.length) return false; // 连个 box 头都凑不齐 —— 断在半截上
+
+    let size = buf.readUInt32BE(at);
+    let head = 8;
+    if (size === 1) {
+      // 64 位长度：紧跟在 type 后面的 8 个字节
+      if (at + 16 > buf.length) return false;
+      const big = buf.readBigUInt64BE(at + 8);
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return true; // 读不动就不表态
+      size = Number(big);
+      head = 16;
+    } else if (size === 0) {
+      return true; // 「一直到文件结尾」，按定义就是完整的
+    }
+
+    if (size < head) return true; // 不合规，不表态
+    const end = at + size;
+    if (end > buf.length) return false; // 这个 box 的末尾在文件外面 —— 确凿残缺
+    at = end;
+  }
+  return true; // box 多到不正常，不表态
 }
 
 /**
@@ -1332,9 +1433,49 @@ const VISION_MAX_SIDE = 1600;
  * @returns {Promise<{buffer: Buffer, mimeType: string}>} 压不动时原样退回
  */
 export async function shrinkForVision(buffer, { mimeType = "", name = "", scope }) {
-  const fallback = () => ({ buffer, mimeType: mimeType || "image/jpeg" });
   const kb = (n) => (n / 1024).toFixed(0);
-  if (!buffer?.length || buffer.length <= VISION_SHRINK_MIN) return fallback();
+  const sniffed = sniffImageType(buffer);
+  /*
+   * 退回原图时 mimeType 以**字节**为准，调用方给的只当兜底。
+   *
+   * iMessage 那边报的 mimeType 经常和内容对不上（这张实机 HEIC 报的是
+   * image/jpeg），而退回原图意味着这份字节要原样送去识别 —— 带着一个错的
+   * mimeType 上去，Gemini 按 JPEG 解一份 HEIC 只会报个看不懂的错。
+   */
+  const fallback = () => ({ buffer, mimeType: sniffed?.mimeType || mimeType || "image/jpeg" });
+  if (!buffer?.length) return fallback();
+
+  /*
+   * HEIC / HEIF / AVIF 不进 ffmpeg，原样送去识别。
+   *
+   * 打包的 ffmpeg（ffmpeg-static 6.1）**解不了** iPhone 直出的 HEIC：那种图
+   * 在容器里是切成图块的网格，6.1 把每块当成独立的流，只解出第一块、其余
+   * 填成平色，然后退出码 0、stderr 里一句不吭。实机表现是一张 1.1MB 的
+   * HEIC 被「压」成 12KB，画面是一整片灰，模型照着那片灰描述一通
+   * （用户报的「我发图他说看到灰蒙蒙的一片」）。
+   *
+   * 上面那道 DECODE_BROKEN 接不住它 —— 那条正则认的是 mjpeg / png 解码器
+   * 的措辞，HEVC 这条路压根不喊。所以只能在**进去之前**拦。
+   *
+   * 代价很小：Gemini 原生收 image/heic 和 image/heif，而 HEIC 本身就是高压缩
+   * 格式，一张 1.1MB 的原图直接上传只多花一两秒。真要压的话得先有能解它的
+   * ffmpeg（8.x 起才有 HEVC 静态图解码，而且对 tiled HEIC 仍然不稳），
+   * 不如直送。
+   *
+   * AVIF 一起拦：ffmpeg 6.1 有 libaom 解码器，但 AVIF 的容器结构和 HEIC 一样
+   * 支持图块网格，没有实机日志能证明它解得对 —— 而 Gemini 收 AVIF，
+   * 不值得为省一两秒去赌。
+   */
+  if (sniffed && NO_FFMPEG_STILLS.has(sniffed.mimeType)) {
+    logDebug(
+      scope,
+      `这张图是 ${sniffed.mimeType}${name ? `「${name}」` : ""}（${kb(buffer.length)}KB），` +
+        `打包的 ffmpeg 解不了它（会压出一片死色），按原图送去识别`
+    );
+    return fallback();
+  }
+
+  if (buffer.length <= VISION_SHRINK_MIN) return fallback();
 
   try {
     const bin = await ffmpegPath();
@@ -2105,12 +2246,16 @@ function dropUnknownField(body, form, raw) {
 }
 
 /**
- * Gemini 类型的服务商源出一张图（Google 官方原生接口）。
+ * Google 原生接口出一张图（`gemini` 和 `vertex` 两种类型共用）。
  *
  * 两种模型两个接口：
  *   Imagen 系    POST …/models/{model}:predict，回 `predictions[0].bytesBase64Encoded`
  *   Gemini 画图  POST …/models/{model}:generateContent，`responseModalities` 里要有
  *                IMAGE，图在 `candidates[0].content.parts[].inlineData` 里
+ *
+ * 请求体两个类型**逐字段相同**，差的只有地址和鉴权头 —— 所以那两样由调用方算好
+ * 传进来（Vertex 的路径带 projects / locations，鉴权还要先换 access token），
+ * 这个函数只管「Google 那套请求体和响应长什么样」。
  *
  * 负面提示词两边都没有对应字段（Imagen 3 起把 negativePrompt 撤了），只能写进
  * 正文里让模型自己避开。比例两边都认同一套写法（`9:16`），config.js:IMAGE_RATIOS
@@ -2119,10 +2264,12 @@ function dropUnknownField(body, form, raw) {
  * 重试规则和 OpenAI 那条路一样（IMAGE_RETRY_DELAYS / worthImageRetry）；比例被嫌弃
  * 时去掉比例重发一次，和那边剥 aspect_ratio 是同一个意思。
  *
+ * @param {{model:string, prompt:string, negative:string, refFile:string|null,
+ *          ratio:object|null, method:(m:string)=>string, headers:object}} args
+ *        `method` 把方法名（`predict` / `generateContent`）拼成完整地址
  * @returns {Promise<{buffer: Buffer, ratioSent: boolean}>}
  */
-async function geminiImage({ base, key, model, prompt, negative, refFile, ratio }, scope) {
-  if (!key) throw new Error("生图模型没填密钥");
+async function geminiImage({ model, prompt, negative, refFile, ratio, urlFor, headers }, scope) {
   const imagen = /^(models\/)?imagen/i.test(model);
   const text = negative ? `${prompt}\n\n画面里不要出现：${negative}` : prompt;
 
@@ -2155,8 +2302,7 @@ async function geminiImage({ base, key, model, prompt, negative, refFile, ratio 
     };
   }
 
-  const url = geminiModelUrl(base, model, imagen ? "predict" : "generateContent");
-  const headers = geminiHeaders(base, key);
+  const url = urlFor(imagen ? "predict" : "generateContent");
   /** 比例还在不在请求体里（上游嫌弃的话会被去掉）。 */
   const ratioIn = () =>
     imagen ? "aspectRatio" in body.parameters : Boolean(body.generationConfig.imageConfig);
@@ -2239,6 +2385,232 @@ async function geminiImage({ base, key, model, prompt, negative, refFile, ratio 
   const buffer = Buffer.from(b64, "base64");
   if (!buffer.length) throw new Error(`返回的图片是空的：${clipBody(raw)}`);
   return { buffer, ratioSent: Boolean(ratio) && ratioIn() };
+}
+
+/*
+ * ================= 聊天接口画图 =================
+ *
+ * 有一类画图模型**压根不在 `/images/generations` 上**，只能当聊天模型调：
+ * 请求是 `/chat/completions`，图片装在回复里。
+ *
+ * 为什么会这样：中转站（绝大多数是 new-api 那套）对这些模型的实现是转发到
+ * 上游的原生多模态接口 —— Gemini 系是 `:generateContent` 带
+ * `responseModalities: [TEXT, IMAGE]`，gpt-image-2.5 那边是 Responses API 的
+ * image_generation 工具。老的 `/images/generations` 这条路它们根本没接，
+ * 打过去的报错长得五花八门，但意思都是「这条路上没有这个模型」：
+ *
+ *   gemini-3.1-flash-image → HTTP 500
+ *     {"error":{"message":"not supported model for image generation,
+ *                only imagen models are supported","type":"new_api_error",
+ *                "code":"convert_request_failed"}}
+ *     （new-api 源码 relay/channel/gemini/adaptor.go：模型名不是 imagen
+ *       前缀就直接拒，而 gemini-*-image 挂在它另一张 SupportedImagineModels
+ *       表里，那张表只在 /chat/completions 那条路上生效）
+ *
+ *   gpt-image-2.5 → HTTP 400
+ *     {"error":{"message":"The model 'gpt-image-2.5' does not exist",
+ *                "type":"image_generation_user_error","param":"model"}}
+ *     （这个 type 是 Responses API 的 image_generation 工具报的 —— 也就是说
+ *       站子确实有这个模型，只是只活在聊天那条路上。同一把配置「测试连接」
+ *       是通的，13 秒回了 ping，足以证明模型名没写错。）
+ *
+ * 所以别拿「模型名写错了」「站子抖动」结案 —— 这两条都是**我们打错了接口**。
+ * 用户那头的表现是「别的小手机能出图，这儿不行」，而站子那边正常扣钱。
+ */
+
+/**
+ * 这些模型**第一发就打聊天接口**，省掉一次注定失败的往返。
+ *
+ * 只是个快捷方式，不是白名单：不在这张表里的模型照旧先打
+ * `/images/generations`，被拒了再兜底过来（见 generateImage 里
+ * chatOnlyImageModel 那段）。所以漏了谁都不会少出一张图，只是多一次往返。
+ *
+ * **这张表只收「在 `/images/generations` 上注定不通」的那几个**，收得很窄：
+ *   - Gemini 系画图模型（`gemini-*-image`、`nano-banana`）—— new-api 的代码里
+ *     写死了那条路只认 imagen 前缀，不是运气问题，是必不通。
+ *   - `imagen` 刻意**不在**这里：它在 `/images/generations` 上恰恰是通的
+ *     （new-api 专门为它做了转换），走聊天接口反而没有。
+ *   - `gpt-image` 系也**不在**这里：官方和多数中转站在 `/images/generations`
+ *     上是通的（剥字段那套逻辑就是照它实测出来的）。只有个别站子把它实现成
+ *     Responses 工具，那种靠兜底兜过去，别为了一家站子改掉所有人的那条路。
+ */
+const CHAT_IMAGE_MODEL_RE = /(gemini[\w.-]*-image|nano[-\s]?banana|[\w.-]*flash-image)/i;
+
+/** 这个模型名要不要直接走聊天接口。 */
+function prefersChatImage(model) {
+  return CHAT_IMAGE_MODEL_RE.test(String(model ?? ""));
+}
+
+/**
+ * `/images/generations` 的失败，是不是「这条路上没有这个模型」。
+ *
+ * 命中就改走聊天接口重打一次（generateImage 里只兜一次，兜完还不行才报错）。
+ * 判据刻意收得很紧 —— 要同时命中「说的是模型/接口不支持」和「不是别的毛病」，
+ * 免得把鉴权失败、余额不足、提示词违规也拖去走第二条路白扣一次钱。
+ */
+function chatOnlyImageModel(status, raw) {
+  if (status !== 400 && status !== 404 && status !== 422 && status !== 500) return false;
+  const s = String(raw ?? "");
+  // 鉴权 / 余额 / 限流 / 内容审核 —— 换条路也是一样的结果，别白打
+  if (/invalid[_ ]api[_ ]key|unauthorized|insufficient|quota|balance|rate.?limit|safety|moderation|content[_ ]policy/i.test(s)) {
+    return false;
+  }
+  return (
+    // new-api 的 Gemini 适配器：只认 imagen
+    /only imagen models are supported/i.test(s) ||
+    // 「这个模型不存在 / 不支持 / 不能用于图像生成」的各种说法
+    (/\bmodel\b|模型/i.test(s) &&
+      /does not exist|not found|not exist|unsupported|not support|无此模型|不支持|不存在/i.test(s)) ||
+    // 站子转换请求时就炸了 —— 多半就是这条路没接这个模型
+    /convert_request_failed|image_generation_user_error/i.test(s)
+  );
+}
+
+/**
+ * 从聊天回复里把图抠出来。三种形状都见过：
+ *
+ *   1. `message.images[].image_url.url`  —— OpenRouter / 部分中转站，data URL
+ *   2. `content` 里的 `![image](data:image/png;base64,…)` —— new-api 就这么干的
+ *      （relaykit/relayconvert/internal/gemini_chat/to_oai_chat_resp.go）
+ *   3. `content` 里一条裸的 `https://…png` 链接 —— 站子把图存自己的 OSS 了
+ *
+ * 1 和 2 返回 `{b64_json}`，3 返回 `{url}`，都是 readImageFrom 认的形状
+ * （那边带下载重试，图已经画完扣过钱了，值得多试几次）。
+ *
+ * @returns {object|null} readImageFrom 能吃的那个形状；一张都没有就是 null
+ */
+function imageInChatReply(data) {
+  const msg = data?.choices?.[0]?.message;
+  if (!msg) return null;
+
+  // 1. images 数组
+  for (const item of msg.images ?? []) {
+    const url = item?.image_url?.url ?? item?.url ?? (typeof item === "string" ? item : "");
+    if (typeof url === "string" && url.trim()) {
+      return /^https?:\/\//i.test(url.trim()) ? { url: url.trim() } : { b64_json: url.trim() };
+    }
+  }
+
+  /*
+   * content 可能是字符串，也可能是 OpenAI 那种 parts 数组（带 image_url 的
+   * 那种形状回流过来）。两种都摊成一段文本再找，顺便把 parts 里的
+   * image_url 直接认掉。
+   */
+  const content = msg.content;
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    for (const p of content) {
+      if (typeof p === "string") text += `\n${p}`;
+      else if (typeof p?.text === "string") text += `\n${p.text}`;
+      const url = p?.image_url?.url ?? p?.image_url;
+      if (typeof url === "string" && url.trim()) {
+        return /^https?:\/\//i.test(url.trim()) ? { url: url.trim() } : { b64_json: url.trim() };
+      }
+    }
+  }
+
+  // 2. markdown 里的 data URL。`![image](…)` 和 `[media](…)` 两种标记都认
+  const dataUrl = /!?\[[^\]]*\]\((data:image\/[^;)]+;base64,[A-Za-z0-9+/=\s]+)\)/i.exec(text);
+  if (dataUrl) return { b64_json: dataUrl[1].replace(/\s+/g, "") };
+  // 没包在 markdown 里的裸 data URL
+  const bare = /data:image\/[^;\s)]+;base64,[A-Za-z0-9+/=]{64,}/i.exec(text);
+  if (bare) return { b64_json: bare[0] };
+
+  // 3. 图片链接。markdown 包着的优先，免得把正文里顺带提到的链接抠出来
+  const mdUrl = /!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i.exec(text);
+  if (mdUrl) return { url: mdUrl[1] };
+  const rawUrl = /https?:\/\/[^\s)<>"']+\.(?:png|jpe?g|webp|gif)(?:\?[^\s)<>"']*)?/i.exec(text);
+  if (rawUrl) return { url: rawUrl[0] };
+
+  return null;
+}
+
+/**
+ * 走 `/chat/completions` 出一张图。
+ *
+ * 请求形状就是一轮普通对话：画面描述当用户消息发过去，图在回复里
+ * （imageInChatReply 负责抠）。额外带两个字段，都是「认就更好、不认也无妨」：
+ *
+ *   `modalities: ["text","image"]`  有的站子靠它开图像输出（OpenRouter 那套）；
+ *                                   new-api 不看这个字段，它按模型名自己决定
+ *   `image_config: {aspect_ratio}`  比例，只在用户明确选了一档时才发
+ *
+ * **不走流式。** 图是一大段 base64，流式拼回来没有任何好处，而且 data URL
+ * 被切成几十个 delta 之后，中间任何一块丢了都是一张坏图。
+ *
+ * 没有重试循环 —— 调用方（generateImage）已经在它自己那个循环里了，这条路
+ * 是它的兜底分支，重试的预算归它管。
+ *
+ * @returns {Promise<{buffer: Buffer, said: string}>} said 是模型顺带说的话，只进日志
+ */
+async function chatImage({ base, key, model, prompt, negative, refFile, ratio }, scope) {
+  const text = negative ? `${prompt}\n\n画面里不要出现：${negative}` : prompt;
+
+  /*
+   * 参考图当一条 image_url 发过去（OpenAI 的视觉消息形状）—— 这些模型本来
+   * 就是多模态的，「看着这张图改」和「照这段话画」走的是同一个接口。
+   */
+  let content = text;
+  if (refFile) {
+    const bytes = await fs.promises.readFile(refFile);
+    const mime = mimeForExt(path.extname(refFile).toLowerCase());
+    content = [
+      { type: "image_url", image_url: { url: `data:${mime};base64,${bytes.toString("base64")}` } },
+      { type: "text", text },
+    ];
+  }
+
+  const body = {
+    model,
+    messages: [{ role: "user", content }],
+    modalities: ["text", "image"],
+    ...(ratio ? { image_config: { aspect_ratio: ratio.key } } : {}),
+  };
+
+  const res = await fetch(`${base}/chat/completions`, {
+    method: "POST",
+    signal: AbortSignal.timeout(IMAGE_TIMEOUT),
+    headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+    body: JSON.stringify(body),
+  });
+
+  const raw = await res.text();
+  if (!res.ok) throw new Error(`生图接口返回 ${res.status}：${clipBody(raw)}`);
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`生图接口返回的不是 JSON：${clipBody(raw)}`);
+  }
+  if (data?.error && !data?.choices?.length) {
+    throw new Error(`生图接口返回了报错：${clipBody(raw)}`);
+  }
+
+  const item = imageInChatReply(data);
+  if (!item) {
+    /*
+     * 模型回了话但没画图。最常见的两种：被审核拦了（它会解释一句），或者
+     * 这个模型压根不会画图（用户把聊天模型勾上了「生图」分类）。两种都把
+     * 它说的那句话原样带出去 —— 比「返回里没有图片」有用得多。
+     */
+    const msg = data?.choices?.[0]?.message;
+    const said = typeof msg?.content === "string" ? msg.content.trim() : "";
+    const why = data?.choices?.[0]?.finish_reason;
+    throw new Error(
+      `这个模型没出图${why && why !== "stop" ? `（${why}）` : ""}：` +
+        `${said ? clipBody(said) : clipBody(raw)}`
+    );
+  }
+
+  const buffer = await readImageFrom(item, scope);
+  if (!buffer?.length) throw new Error(`返回的图片是空的：${clipBody(raw)}`);
+
+  const msg = data?.choices?.[0]?.message;
+  const said = typeof msg?.content === "string" ? msg.content.replace(/!?\[[^\]]*\]\([^)]*\)/g, "").trim() : "";
+  return { buffer, said };
 }
 
 /**
@@ -2398,6 +2770,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
   if (!base) throw new Error("生图模型没填接口地址");
   if (!model) throw new Error("生图模型没填模型名");
   const type = apiType(endpoint);
+  // 服务账号 JSON 粘到了别的类型上：在拼鉴权头之前拦住，别让私钥进错误消息
+  assertKeyIsNotServiceAccount(type, key, "生图模型");
   // Claude 只会看图不会画图，打过去只会白花一次钱再 404
   if (type === "anthropic") {
     throw new Error("生图模型选的是 Claude 类型的服务商源，Claude 不会画图，换一个别的服务商源");
@@ -2439,10 +2813,32 @@ export async function generateImage(endpoint, req, scope = "生图") {
     return { buffer, mimeType, ext, ms };
   }
 
-  // Gemini 类型走原生接口，请求和响应都是另一个样子，见 geminiImage
-  if (type === "gemini") {
+  // Gemini / Vertex 走 Google 原生接口，请求和响应都是另一个样子，见 geminiImage。
+  // 两者请求体相同，差的只有地址和鉴权头，所以在这儿算好再传进去
+  if (type === "gemini" || type === "vertex") {
+    if (!key) throw new Error("生图模型没填密钥");
+    let urlFor;
+    let headers;
+    if (type === "vertex") {
+      if (isVertexClaude(model)) {
+        throw new Error("生图模型选的是 Vertex 上的 Claude，Claude 不会画图，换一个 Gemini 或 Imagen 的模型");
+      }
+      const auth = await vertexAuth(base, key);
+      urlFor = (method) =>
+        vertexModelUrl({
+          root: auth.root,
+          project: auth.project,
+          region: auth.region,
+          model,
+          method,
+        });
+      headers = auth.headers;
+    } else {
+      urlFor = (method) => geminiModelUrl(base, model, method);
+      headers = geminiHeaders(base, key);
+    }
     const { buffer, ratioSent } = await geminiImage(
-      { base, key, model, prompt, negative, refFile, ratio },
+      { model, prompt, negative, refFile, ratio, urlFor, headers },
       scope
     );
     const ms = Date.now() - startedAt;
@@ -2454,6 +2850,35 @@ export async function generateImage(endpoint, req, scope = "生图") {
         `${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`
     );
     return { buffer, mimeType, ext, ms };
+  }
+
+  /** 走聊天接口画图，成功就直接返回（下面两处用：抢先走、和兜底走）。 */
+  const viaChat = async (why) => {
+    if (why) logInfo(scope, why);
+    const { buffer, said } = await chatImage(
+      { base, key, model, prompt, negative, refFile, ratio },
+      scope
+    );
+    const ms = Date.now() - startedAt;
+    const { mimeType, ext } = sniffImage(buffer);
+    logInfo(
+      scope,
+      `${endpoint?.label ?? model} 出图成功（走的聊天接口），${Math.round(buffer.length / 1024)}KB ${ext}，` +
+        `耗时 ${ms}ms${ratio ? `（要的是 ${ratio.key}）` : ""}` +
+        `${refFile ? `（参考图 ${path.basename(refFile)}）` : ""}`,
+      // 模型顺带说的话只进 detail —— 它不影响发图，但排查「图对不对」时有用
+      said || undefined
+    );
+    return { buffer, mimeType, ext, ms };
+  };
+
+  /*
+   * 这个模型只活在聊天接口上（见 CHAT_IMAGE_MODEL_RE 上面那段）—— 直接走，
+   * 不先去 /images/generations 白撞一次。认错了也不要紧：聊天接口那边报错
+   * 照样抛出来，不会悄悄发一张坏图。
+   */
+  if (prefersChatImage(model)) {
+    return viaChat(`${model} 这类模型只能走聊天接口画图，直接走那条路`);
   }
 
   /*
@@ -2519,6 +2944,8 @@ export async function generateImage(endpoint, req, scope = "生图") {
   // 一次运气」，混在一个计数里会让「剥完一个字段又赶上一次抖动」提前用光额度
   let drops = 0;
   let retries = 0;
+  /** 聊天接口那条兜底路走过没有。只兜一次 —— 两条路都不通就该报错了。 */
+  let chatTried = false;
   for (;;) {
     try {
       /*
@@ -2557,6 +2984,32 @@ export async function generateImage(endpoint, req, scope = "生图") {
         drops += 1;
         logInfo(scope, `上游不认 ${dropped} 这个字段，去掉它重发一次`);
         continue;
+      }
+    }
+
+    /*
+     * 「这条路上没有这个模型」—— 改走聊天接口再试一次（只试一次：chatTried）。
+     *
+     * 放在剥字段后面、重试前面：剥字段是「请求能改对」，这条是「路走错了」，
+     * 都比「再碰一次运气」更可能是真正的原因。重试那条路对这种失败毫无用处
+     * （下一发还是同一个接口、同一个模型），原来就是在那儿白等 6 秒然后报错。
+     */
+    // okButError 是「HTTP 200、体里装着报错」（见 errorInOkBody）—— 按 400 判
+    if (!chatTried && chatOnlyImageModel(okButError ? 400 : res.status, raw)) {
+      chatTried = true;
+      try {
+        return await viaChat(
+          `这个模型在 /images/generations 上不通（HTTP ${res.status}），改走聊天接口再试一次`
+        );
+      } catch (e) {
+        /*
+         * 两条路都不行。报错要带上**两边**的原因 —— 只报聊天接口那句的话，
+         * 用户会以为问题出在聊天接口上，而真正该看的多半是第一条路那句。
+         */
+        throw new Error(
+          `生图两条路都不通。/images/generations 返回 ${res.status}：${clipBody(raw)}；` +
+            `聊天接口：${String(e?.message ?? e)}`
+        );
       }
     }
 
